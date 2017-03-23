@@ -1,0 +1,6 @@
+{
+  "scripts": {
+    "test": "elm make test/Main.elm --output test/elm.js && node test/main.js"
+  },
+  "license": "Unlicense"
+}
