@@ -1,11 +1,11 @@
 effect module EventEmitter
     where { command = MyCmd }
     exposing
-        ( listen
+        ( Id
+        , listen
         , listenOnce
         , unlisten
         , trigger
-        , Id
         )
 
 {-|
