@@ -2,10 +2,15 @@
 const elm = require('./elm.js');
 
 // Start
-elm.Main.worker();
+const ports = elm.Main.worker().ports;
 
 // keep our app alive until we get an exitCode from Elm or SIGINT or SIGTERM (see below)
 setInterval(id => id, 86400);
+
+ports.exitApp.subscribe(exitCode => {
+	console.log('Exit code from Elm:', exitCode);
+	process.exit(exitCode);
+});
 
 process.on('uncaughtException', err => {
 	console.log(`Uncaught exception:\n`, err);
@@ -14,10 +19,10 @@ process.on('uncaughtException', err => {
 
 process.on('SIGINT', _ => {
 	console.log(`SIGINT received.`);
-	process.exit(0);
+	ports.externalStop.send(null);
 });
 
 process.on('SIGTERM', _ => {
 	console.log(`SIGTERM received.`);
-	process.exit(0);
+	ports.externalStop.send(null);
 });

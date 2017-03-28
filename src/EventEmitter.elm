@@ -6,12 +6,16 @@ effect module EventEmitter
         , listenOnce
         , unlisten
         , trigger
+        , receive
+        , receiveOnce
+        , unreceive
+        , send
         )
 
 {-|
     Event Emitter
 
-@docs listen , listenOnce , unlisten, trigger , Id
+@docs Id, listen, listenOnce, unlisten, trigger, receive, receiveOnce, unreceive, send
 -}
 
 import Dict exposing (..)
@@ -28,23 +32,34 @@ type alias Id =
 
 
 type MyCmd msg
-    = Listen Id Bool (TriggerTagger msg)
-    | Unlisten Id (TriggerTagger msg)
+    = Listen Id (EventTagger msg)
+    | ListenOnce Id (EventTagger msg)
+    | Unlisten Id (EventTagger msg)
     | Trigger Id
+    | Receive Id (SendTagger msg)
+    | ReceiveOnce Id (SendTagger msg)
+    | Unreceive Id (SendTagger msg)
+    | Send Id String
 
 
 
 -- Taggers
 
 
-{-| Send completion tagger
+{-| Event Tagger
 -}
-type alias TriggerTagger msg =
+type alias EventTagger msg =
     Id -> msg
 
 
-type alias ListenState msg =
-    { tagger : TriggerTagger msg
+{-| Send completion tagger
+-}
+type alias SendTagger msg =
+    String -> Id -> msg
+
+
+type alias SubscriberState eventTagger =
+    { tagger : eventTagger
     , once : Bool
     }
 
@@ -52,7 +67,8 @@ type alias ListenState msg =
 {-| Effects manager state
 -}
 type alias State msg =
-    { events : Dict Id (List (ListenState msg))
+    { listeners : Dict Id (List (SubscriberState (EventTagger msg)))
+    , receivers : Dict Id (List (SubscriberState (SendTagger msg)))
     }
 
 
@@ -60,11 +76,19 @@ type alias State msg =
 -- Cmds
 
 
+compose2 : (c -> d) -> (a -> b -> c) -> a -> b -> d
+compose2 f2 f1 a =
+    (<<) f2 <| f1 a
+
+
 cmdMap : (a -> b) -> MyCmd a -> MyCmd b
 cmdMap f cmd =
     case cmd of
-        Listen eventId once tagger ->
-            Listen eventId once (f << tagger)
+        Listen eventId tagger ->
+            Listen eventId (f << tagger)
+
+        ListenOnce eventId tagger ->
+            ListenOnce eventId (f << tagger)
 
         Unlisten eventId tagger ->
             Unlisten eventId (f << tagger)
@@ -72,24 +96,36 @@ cmdMap f cmd =
         Trigger eventId ->
             Trigger eventId
 
+        Receive eventId tagger ->
+            Receive eventId (compose2 f tagger)
+
+        ReceiveOnce eventId tagger ->
+            ReceiveOnce eventId (compose2 f tagger)
+
+        Unreceive eventId tagger ->
+            Unreceive eventId (compose2 f tagger)
+
+        Send eventId payload ->
+            Send eventId payload
+
 
 {-| Listen to id
 -}
-listen : TriggerTagger msg -> Id -> Cmd msg
+listen : EventTagger msg -> Id -> Cmd msg
 listen tagger eventId =
-    command (Listen eventId False tagger)
+    command (Listen eventId tagger)
 
 
-{-| Listen once to id
+{-| Listen ONCE to id
 -}
-listenOnce : TriggerTagger msg -> Id -> Cmd msg
+listenOnce : EventTagger msg -> Id -> Cmd msg
 listenOnce tagger eventId =
-    command (Listen eventId True tagger)
+    command (ListenOnce eventId tagger)
 
 
 {-| Stop listening to id
 -}
-unlisten : TriggerTagger msg -> Id -> Cmd msg
+unlisten : EventTagger msg -> Id -> Cmd msg
 unlisten tagger eventId =
     command (Unlisten eventId tagger)
 
@@ -99,6 +135,34 @@ unlisten tagger eventId =
 trigger : Id -> Cmd msg
 trigger eventId =
     command (Trigger eventId)
+
+
+{-| Receive data from  id
+-}
+receive : SendTagger msg -> Id -> Cmd msg
+receive tagger eventId =
+    command (Receive eventId tagger)
+
+
+{-| Receive ONCE data from  id
+-}
+receiveOnce : SendTagger msg -> Id -> Cmd msg
+receiveOnce tagger eventId =
+    command (ReceiveOnce eventId tagger)
+
+
+{-| Stop receving data from id
+-}
+unreceive : SendTagger msg -> Id -> Cmd msg
+unreceive tagger eventId =
+    command (Unreceive eventId tagger)
+
+
+{-| Send data to all receivers on id
+-}
+send : Id -> String -> Cmd msg
+send eventId payload =
+    command (Send eventId payload)
 
 
 
@@ -134,7 +198,7 @@ trigger eventId =
 
 init : Task Never (State msg)
 init =
-    Task.succeed <| State Dict.empty
+    Task.succeed <| State Dict.empty Dict.empty
 
 
 
@@ -158,67 +222,93 @@ onEffects router cmds state =
             &> Task.succeed cmdState
 
 
-settings0 : Platform.Router msg (Msg msg) -> (a -> Msg msg) -> Msg msg -> { onError : a -> Task msg (), onSuccess : Never -> Task x () }
-settings0 router errorTagger tagger =
-    { onError = \err -> Platform.sendToSelf router (errorTagger err)
-    , onSuccess = \_ -> Platform.sendToSelf router tagger
-    }
+subscribe : Id -> Bool -> tagger -> (State msg -> Dict Id (List (SubscriberState tagger))) -> (State msg -> Dict Id (List (SubscriberState tagger)) -> State msg) -> State msg -> ( Task Never (), State msg )
+subscribe eventId once tagger getter setter state =
+    let
+        subscriberState =
+            { tagger = tagger
+            , once = once
+            }
+
+        subscribers =
+            getter state
+    in
+        ( Task.succeed (), setter state <| Dict.insert eventId (subscriberState :: (Dict.get eventId subscribers ?= [])) subscribers )
 
 
-settings1 : Platform.Router msg (Msg msg) -> (a -> Msg msg) -> (b -> Msg msg) -> { onError : a -> Task Never (), onSuccess : b -> Task x () }
-settings1 router errorTagger tagger =
-    { onError = \err -> Platform.sendToSelf router (errorTagger err)
-    , onSuccess = \result1 -> Platform.sendToSelf router (tagger result1)
-    }
+unsubscribe : Id -> tagger -> (tagger -> String -> msg) -> (State msg -> Dict Id (List (SubscriberState tagger))) -> (State msg -> Dict Id (List (SubscriberState tagger)) -> State msg) -> State msg -> ( Task Never (), State msg )
+unsubscribe eventId tagger bindTagger getter setter state =
+    let
+        subscribers =
+            getter state
+    in
+        Dict.get eventId subscribers
+            |?> (\subscrberStates ->
+                    let
+                        msg =
+                            (bindTagger tagger) ""
+
+                        remainingSubscribers =
+                            subscrberStates
+                                |> List.filter (\subscriberState -> (bindTagger subscriberState.tagger) "" /= msg)
+                    in
+                        ( Task.succeed (), setter state <| (remainingSubscribers == []) ? ( Dict.remove eventId subscribers, Dict.insert eventId remainingSubscribers subscribers ) )
+                )
+            ?= ( Task.succeed (), state )
 
 
-settings2 : Platform.Router msg (Msg msg) -> (a -> Msg msg) -> (b -> c -> Msg msg) -> { onError : a -> Task Never (), onSuccess : b -> c -> Task x () }
-settings2 router errorTagger tagger =
-    { onError = \err -> Platform.sendToSelf router (errorTagger err)
-    , onSuccess = \result1 result2 -> Platform.sendToSelf router (tagger result1 result2)
-    }
+publish : Platform.Router msg (Msg msg) -> Id -> (tagger -> String -> msg) -> (State msg -> Dict Id (List (SubscriberState tagger))) -> (State msg -> Dict Id (List (SubscriberState tagger)) -> State msg) -> State msg -> ( Task Never (), State msg )
+publish router eventId bindTagger getter setter state =
+    let
+        subscribers =
+            getter state
+
+        task =
+            (Dict.get eventId subscribers ?= [])
+                |> List.map .tagger
+                |> List.map (\tagger -> Platform.sendToApp router ((bindTagger tagger) eventId))
+                |> List.foldl (&>) (Task.succeed ())
+
+        remainingSubscribers =
+            (Dict.get eventId subscribers ?= [])
+                |> List.filter (not << .once)
+    in
+        ( task, setter state ((remainingSubscribers == []) ? ( Dict.remove eventId subscribers, Dict.insert eventId remainingSubscribers subscribers )) )
 
 
 handleCmd : Platform.Router msg (Msg msg) -> State msg -> MyCmd msg -> ( Task Never (), State msg )
 handleCmd router state cmd =
-    case cmd of
-        Listen eventId once tagger ->
-            let
-                listenState =
-                    { tagger = tagger
-                    , once = once
-                    }
-            in
-                ( Task.succeed (), { state | events = Dict.insert eventId (listenState :: (Dict.get eventId state.events ?= [])) state.events } )
+    let
+        listenersSetter state listeners =
+            { state | listeners = listeners }
 
-        Unlisten eventId tagger ->
-            Dict.get eventId state.events
-                |?> (\listenStates ->
-                        let
-                            msg =
-                                tagger ""
+        receiversSetter state receivers =
+            { state | receivers = receivers }
+    in
+        case cmd of
+            Listen eventId tagger ->
+                subscribe eventId False tagger .listeners listenersSetter state
 
-                            listeners =
-                                listenStates
-                                    |> List.filter (\listenState -> listenState.tagger "" /= msg)
-                        in
-                            ( Task.succeed (), { state | events = (listeners == []) ? ( Dict.remove eventId state.events, Dict.insert eventId listeners state.events ) } )
-                    )
-                ?= ( Task.succeed (), state )
+            ListenOnce eventId tagger ->
+                subscribe eventId True tagger .listeners listenersSetter state
 
-        Trigger eventId ->
-            let
-                task =
-                    (Dict.get eventId state.events ?= [])
-                        |> List.map .tagger
-                        |> List.map (\tagger -> Platform.sendToApp router (tagger eventId))
-                        |> List.foldl (&>) (Task.succeed ())
+            Unlisten eventId tagger ->
+                unsubscribe eventId tagger identity .listeners listenersSetter state
 
-                listeners =
-                    (Dict.get eventId state.events ?= [])
-                        |> List.filter (not << .once)
-            in
-                ( task, { state | events = (listeners == []) ? ( Dict.remove eventId state.events, Dict.insert eventId listeners state.events ) } )
+            Trigger eventId ->
+                publish router eventId identity .listeners listenersSetter state
+
+            Receive eventId tagger ->
+                subscribe eventId False tagger .receivers receiversSetter state
+
+            ReceiveOnce eventId tagger ->
+                subscribe eventId True tagger .receivers receiversSetter state
+
+            Unreceive eventId tagger ->
+                unsubscribe eventId tagger (\tagger -> tagger "") .receivers receiversSetter state
+
+            Send eventId payload ->
+                publish router eventId (\tagger -> tagger payload) .receivers receiversSetter state
 
 
 type Msg msg

@@ -1,5 +1,5 @@
 {
-    "version": "1.0.0",
+    "version": "2.0.0",
     "summary": "Event Emitter Effects Manager for Elm",
     "repository": "https://github.com/panosoft/elm-event-emitter.git",
     "license": "Unlicense",
